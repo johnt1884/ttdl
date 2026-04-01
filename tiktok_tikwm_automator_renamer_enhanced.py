@@ -4,6 +4,7 @@ import glob
 import shutil
 import requests
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, quote
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -43,24 +44,12 @@ def sanitize_filename(username, videoid):
     videoid = videoid.strip() if videoid else "unknown_id"
     return f"{safe_username} - {videoid}.mp4"
 
-# --- Helper: make unique filename if needed (checks downloads + mapped dirs) ---
-def make_unique_filename(filename, existing_files_set, base_td=r"C:\Bridge\Downloads\td"):
+# --- Helper: make unique filename if needed (checks downloads + cached existing files) ---
+def make_unique_filename(filename, existing_files_set):
     name, ext = os.path.splitext(filename)
     candidate = filename
     i = 1
-    # Build a set of existing filenames across downloads and mapped base_td directory
-    while True:
-        collision = False
-        if candidate in existing_files_set:
-            collision = True
-        else:
-            # also check mapped base_td recursively
-            for root, dirs, files in os.walk(base_td):
-                if candidate in files:
-                    collision = True
-                    break
-        if not collision:
-            break
+    while candidate in existing_files_set:
         candidate = f"{name} ({i}){ext}"
         i += 1
     # register candidate to existing_files_set to avoid future collisions
@@ -68,7 +57,7 @@ def make_unique_filename(filename, existing_files_set, base_td=r"C:\Bridge\Downl
     return candidate
 
 # --- Download helper ---
-def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='downloads', max_retries=2, allow_duplicate=False, existing_files_set=None, base_td=r"C:\Bridge\Downloads\td"):
+def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='downloads', max_retries=2, allow_duplicate=False, existing_files_set=None):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Referer': referer,
@@ -85,7 +74,7 @@ def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='down
     if allow_duplicate:
         if existing_files_set is None:
             existing_files_set = set(os.listdir(output_dir))
-        unique_name = make_unique_filename(filename, existing_files_set, base_td=base_td)
+        unique_name = make_unique_filename(filename, existing_files_set)
         filepath = os.path.join(output_dir, unique_name)
     else:
         filepath = os.path.join(output_dir, filename)
@@ -154,10 +143,10 @@ if os.path.exists('user_dir_map.txt'):
 # --- Gather existing filenames ---
 existing_files = set(os.listdir('downloads'))
 base_td = r"C:\Bridge\Downloads\td"
-for username, subdir in user_map.items():
-    target_dir = os.path.join(base_td, subdir)
-    if os.path.exists(target_dir):
-        for f in os.listdir(target_dir):
+print(f"Caching existing filenames from {base_td} (this may take a moment)...")
+if os.path.exists(base_td):
+    for root, dirs, files in os.walk(base_td):
+        for f in files:
             existing_files.add(f)
 
 # --- New menu: 12 options (4 actions × 3 sites) ---
@@ -213,10 +202,7 @@ if use_cobalt:
 
 # --- Windows-only kill handling ---
 def kill_chrome_processes_windows():
-    try:
-        subprocess.call(['taskkill', '/f', '/im', 'chrome.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    # Only kill chromedriver to avoid closing user's open Chrome windows
     try:
         subprocess.call(['taskkill', '/f', '/im', 'chromedriver.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -233,6 +219,18 @@ options.add_argument('--no-sandbox')
 options.add_argument('--disable-dev-shm-usage')
 options.add_argument('--disable-gpu')
 options.add_argument('--remote-debugging-port=9222')
+
+# Optimization: Disable unnecessary features for speed
+options.add_argument('--disable-images')
+options.add_argument('--disable-extensions')
+options.add_argument('--disable-infobars')
+options.add_argument('--disable-notifications')
+
+# Separate profile to avoid conflicts with personal Chrome
+profile_path = os.path.abspath("chrome_profile")
+options.add_argument(f'--user-data-dir={profile_path}')
+options.add_argument('--profile-directory=TikTokAutomator')
+
 options.add_experimental_option("prefs", {
     "download.default_directory": os.path.abspath("downloads"),
     "download.prompt_for_download": False,
@@ -264,7 +262,7 @@ except WebDriverException as e:
     print(f"Failed to launch ChromeDriver: {e}")
     exit()
 
-driver.implicitly_wait(10)
+driver.implicitly_wait(2)
 wait = WebDriverWait(driver, 20)
 
 # --- Helper: click "Do not consent" on MusicalDown whenever visible ---
@@ -348,7 +346,9 @@ total_urls = len(urls_to_process)
 successful = 0
 failed_urls = []
 sd_saved = [] # record situations where SD was used (url, href)
-batch_size = 6
+download_executor = ThreadPoolExecutor(max_workers=5)
+download_futures = []
+batch_size = 10
 num_batches = (total_urls + batch_size - 1) // batch_size
 initial_count = len(glob.glob('downloads/*.mp4'))
 
@@ -357,6 +357,21 @@ for batch_start in range(0, total_urls, batch_size):
     batch = urls_to_process[batch_start:batch_end]
     current_batch = (batch_start // batch_size) + 1
     print(f"\n--- Processing batch {current_batch}/{num_batches} (URLs {batch_start+1}-{batch_end} of {total_urls}) ---")
+
+    # Load the site once per batch
+    try:
+        driver.get(start_url)
+        # Use smarter waits instead of fixed sleep
+        if use_cobalt:
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea")))
+        elif use_musicaldown:
+            wait.until(EC.presence_of_element_located((By.ID, "link_url")))
+        else:
+            wait.until(EC.presence_of_element_located((By.ID, "params")))
+        try_click_do_not_consent()
+    except Exception as e:
+        print(f" Failed to load site for batch {current_batch}: {e}")
+
     batch_success, batch_skipped = 0, 0
     for idx, url in enumerate(batch, 1):
         username, videoid = extract_tiktok_info(url)
@@ -371,21 +386,21 @@ for batch_start in range(0, total_urls, batch_size):
         while retries < max_retries and not url_success:
             retries += 1
             try:
-                # Before each attempt, navigate to the start page for a clean form unless using Cobalt SPA behavior
-                if use_cobalt:
-                    try:
+                # Check if we need to reload (non-SPA and input field missing or it's a retry)
+                if not use_cobalt:
+                    if retries > 1:
                         driver.get(start_url)
-                        time.sleep(1.5)
-                    except Exception as e:
-                        print(f" Failed to load Cobalt start page: {e}")
-                else:
-                    try:
-                        driver.get(start_url)
-                        time.sleep(1.5)
-                    except Exception as e:
-                        print(f" Failed to load start page: {e}")
-                # Try click consent if present (for MusicalDown, but safe to attempt on others)
-                try_click_do_not_consent()
+                        try_click_do_not_consent()
+                    else:
+                        input_selector = (By.ID, "params") if use_tikwm else (By.ID, "link_url")
+                        try:
+                            driver.find_element(*input_selector)
+                        except NoSuchElementException:
+                            driver.get(start_url)
+                            try_click_do_not_consent()
+                elif retries > 1:
+                    driver.get(start_url)
+
                 href = None
                 cookies = []
                 referer = driver.current_url
@@ -411,6 +426,7 @@ for batch_start in range(0, total_urls, batch_size):
                             href = download_anchor.get_attribute('data-url')
                         if not href:
                             raise ValueError('No href found on download element')
+                        # Optimization: only fetch cookies just before download
                         cookies = driver.get_cookies()
                         referer = driver.current_url
                         print(f" Extracted href: {href[:120]}...")
@@ -466,6 +482,7 @@ for batch_start in range(0, total_urls, batch_size):
                             href = download_anchor.get_attribute('data-url')
                         if not href:
                             raise ValueError('No href found on HD download anchor')
+                        # Optimization: only fetch cookies just before download
                         cookies = driver.get_cookies()
                         referer = driver.current_url
                         print(f" Extracted HD href: {href[:120]}...")
@@ -476,6 +493,8 @@ for batch_start in range(0, total_urls, batch_size):
                             href = fallback_anchor.get_attribute('href')
                             if not href:
                                 href = fallback_anchor.get_attribute('data-url')
+
+                            # Optimization: only fetch cookies just before download
                             cookies = driver.get_cookies()
                             referer = driver.current_url
                             print(f" Extracted SD href (fallback): {href[:120]}...")
@@ -505,6 +524,7 @@ for batch_start in range(0, total_urls, batch_size):
                         href = download_link.get_attribute('href')
                         if not href or 'mp4' not in href.lower():
                             raise ValueError(f"Invalid href: {href}")
+                        # Optimization: only fetch cookies just before download
                         cookies = driver.get_cookies()
                         referer = driver.current_url
                         print(f" Extracted href: {href[:120]}...")
@@ -512,26 +532,33 @@ for batch_start in range(0, total_urls, batch_size):
                         raise
 
                 # Attempt to download the extracted href (only if href was found)
-                if href and download_file_from_href(href, cookies, referer, url, allow_duplicate=not check_exists, existing_files_set=existing_files, base_td=base_td):
+                if href:
+                    future = download_executor.submit(download_file_from_href, href, cookies, referer, url, allow_duplicate=not check_exists, existing_files_set=existing_files)
+                    download_futures.append(future)
                     url_success = True
                     batch_success += 1
                     successful += 1
-                    # After successful download, for non-Cobalt, navigate back to start page or remain for SPA
-                    if not use_cobalt:
+
+                    # For Cobalt, clear input for next use
+                    if use_cobalt:
                         try:
-                            driver.get(start_url)
-                            time.sleep(0.5)
-                        except Exception:
+                            url_input = driver.find_element(By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea")
+                            url_input.clear()
+                        except:
                             pass
+                    # After successful download, stay on page to see if we can reuse it
                     break
             except TimeoutException:
-                print(" Timeout waiting for result, retrying...")
-                time.sleep(5)
+                # Exponential backoff for retries
+                wait_time = retries
+                print(f" Timeout waiting for result, retrying in {wait_time}s...")
+                time.sleep(wait_time)
             except Exception as e:
-                print(f" Error on attempt {retries}: {e}")
+                wait_time = retries
+                print(f" Error on attempt {retries}: {e}. Retrying in {wait_time}s...")
                 if retries == max_retries:
                     failed_urls.append(url)
-                time.sleep(1)
+                time.sleep(wait_time)
         if not url_success:
             print(f" URL {idx} failed after {max_retries} retries")
             if url not in failed_urls:
@@ -621,6 +648,28 @@ def move_files_to_user_dirs(base_dir=r"C:\Bridge\Downloads\td"):
     save_user_map(user_map)
     print(f"\nMove summary: {moved} moved, {replaced} replaced, {skipped} skipped.")
     print("User directory mappings saved to user_dir_map.txt\n")
+
+# Wait for all downloads to complete
+print("\nWaiting for all downloads to finish...")
+for future in download_futures:
+    future.result()
+download_executor.shutdown(wait=True)
+
+# --- Small File Check ---
+print("\nChecking for small files (< 2KB)...")
+small_files = []
+for f in os.listdir('downloads'):
+    if f.lower().endswith('.mp4'):
+        path = os.path.join('downloads', f)
+        if os.path.getsize(path) < 2048:
+            small_files.append(f)
+
+if small_files:
+    print(f"⚠️ Found {len(small_files)} file(s) smaller than 2KB:")
+    for sf in small_files:
+        print(f" - {sf}")
+else:
+    print("No small files found.")
 
 # --- Summary ---
 print(f"\nAutomation complete! Successful: {successful}/{total_urls}")
