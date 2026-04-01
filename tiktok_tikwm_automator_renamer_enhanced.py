@@ -4,6 +4,7 @@ import glob
 import shutil
 import requests
 import subprocess
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, quote
 from selenium import webdriver
@@ -44,16 +45,20 @@ def sanitize_filename(username, videoid):
     videoid = videoid.strip() if videoid else "unknown_id"
     return f"{safe_username} - {videoid}.mp4"
 
+# --- Locks for thread safety ---
+existing_files_lock = Lock()
+
 # --- Helper: make unique filename if needed (checks downloads + cached existing files) ---
 def make_unique_filename(filename, existing_files_set):
     name, ext = os.path.splitext(filename)
     candidate = filename
     i = 1
-    while candidate in existing_files_set:
-        candidate = f"{name} ({i}){ext}"
-        i += 1
-    # register candidate to existing_files_set to avoid future collisions
-    existing_files_set.add(candidate)
+    with existing_files_lock:
+        while candidate in existing_files_set:
+            candidate = f"{name} ({i}){ext}"
+            i += 1
+        # register candidate to existing_files_set to avoid future collisions
+        existing_files_set.add(candidate)
     return candidate
 
 # --- Download helper ---
@@ -155,6 +160,27 @@ sites = [
     ("MusicalDown", "https://musicaldown.com/en"),
     ("Cobalt", "https://cobalt.tools")
 ]
+
+# --- Selectors Mapping ---
+SITE_SELECTORS = {
+    "tikwm": {
+        "input": (By.ID, "params"),
+        "submit": (By.CSS_SELECTOR, "button.btn-submit"),
+        "result": (By.CSS_SELECTOR, "a.btn.btn-success[download]")
+    },
+    "musicaldown": {
+        "input": (By.ID, "link_url"),
+        "submit": (By.CSS_SELECTOR, "form#submit-form button[type=submit], form button[type=submit]"),
+        "result_hd": (By.CSS_SELECTOR, "a.download[data-event='hd_download_click']"),
+        "result_sd": (By.CSS_SELECTOR, "a.download")
+    },
+    "cobalt": {
+        "input": (By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea"),
+        "submit": (By.ID, "download-button"),
+        "submit_fallback": (By.CSS_SELECTOR, "button, input[type=submit]"),
+        "result": (By.CSS_SELECTOR, "a[href$='.mp4'], .download a, a.download")
+    }
+}
 actions = [
     ("Start in headless mode", {"kill_before": False, "headless": True}),
     ("Start in visible mode", {"kill_before": False, "headless": False}),
@@ -221,7 +247,13 @@ options.add_argument('--disable-gpu')
 options.add_argument('--remote-debugging-port=9222')
 
 # Optimization: Disable unnecessary features for speed
-options.add_argument('--disable-images')
+options.add_experimental_option("prefs", {
+    "profile.managed_default_content_settings.images": 2, # Disable images for faster load
+    "download.default_directory": os.path.abspath("downloads"),
+    "download.prompt_for_download": False,
+    "download.directory_upgrade": True,
+    "safebrowsing.enabled": True
+})
 options.add_argument('--disable-extensions')
 options.add_argument('--disable-infobars')
 options.add_argument('--disable-notifications')
@@ -231,12 +263,6 @@ profile_path = os.path.abspath("chrome_profile")
 options.add_argument(f'--user-data-dir={profile_path}')
 options.add_argument('--profile-directory=TikTokAutomator')
 
-options.add_experimental_option("prefs", {
-    "download.default_directory": os.path.abspath("downloads"),
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    "safebrowsing.enabled": True
-})
 if headless_mode:
     # Use the new headless mode flag where supported
     options.add_argument("--headless=new")
@@ -276,7 +302,7 @@ def try_click_do_not_consent():
                 if btn.is_displayed():
                     print("Found 'Do not consent' button — clicking it.")
                     driver.execute_script("arguments[0].click();", btn)
-                    time.sleep(1.0)
+                    time.sleep(0.5)
                     return True
             except Exception:
                 pass
@@ -346,7 +372,8 @@ total_urls = len(urls_to_process)
 successful = 0
 failed_urls = []
 sd_saved = [] # record situations where SD was used (url, href)
-download_executor = ThreadPoolExecutor(max_workers=5)
+max_workers = min(5, os.cpu_count() or 4)
+download_executor = ThreadPoolExecutor(max_workers=max_workers)
 download_futures = []
 batch_size = 10
 num_batches = (total_urls + batch_size - 1) // batch_size
@@ -362,12 +389,8 @@ for batch_start in range(0, total_urls, batch_size):
     try:
         driver.get(start_url)
         # Use smarter waits instead of fixed sleep
-        if use_cobalt:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea")))
-        elif use_musicaldown:
-            wait.until(EC.presence_of_element_located((By.ID, "link_url")))
-        else:
-            wait.until(EC.presence_of_element_located((By.ID, "params")))
+        site_key = selected["site_name"].lower()
+        wait.until(EC.presence_of_element_located(SITE_SELECTORS[site_key]["input"]))
         try_click_do_not_consent()
     except Exception as e:
         print(f" Failed to load site for batch {current_batch}: {e}")
@@ -387,14 +410,14 @@ for batch_start in range(0, total_urls, batch_size):
             retries += 1
             try:
                 # Check if we need to reload (non-SPA and input field missing or it's a retry)
+                site_key = selected["site_name"].lower()
                 if not use_cobalt:
                     if retries > 1:
                         driver.get(start_url)
                         try_click_do_not_consent()
                     else:
-                        input_selector = (By.ID, "params") if use_tikwm else (By.ID, "link_url")
                         try:
-                            driver.find_element(*input_selector)
+                            driver.find_element(*SITE_SELECTORS[site_key]["input"])
                         except NoSuchElementException:
                             driver.get(start_url)
                             try_click_do_not_consent()
@@ -405,22 +428,21 @@ for batch_start in range(0, total_urls, batch_size):
                 cookies = []
                 referer = driver.current_url
                 if use_cobalt:
-                    # Cobalt flow (no outer try-except needed; inners handle specifics, main catches rest)
-                    url_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea")))
+                    # Cobalt flow
+                    url_input = wait.until(EC.presence_of_element_located(SITE_SELECTORS["cobalt"]["input"]))
                     url_input.clear()
                     url_input.send_keys(url)
-                    # Click the download button (Cobalt may use ID "download-button")
+                    # Click the download button
                     try:
-                        submit_btn = wait.until(EC.element_to_be_clickable((By.ID, "download-button")))
+                        submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["cobalt"]["submit"]))
                     except TimeoutException:
                         # Fallback to any button
-                        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button, input[type=submit]")))
+                        submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["cobalt"]["submit_fallback"]))
                     submit_btn.click()
                     print(f" Submitted to Cobalt (attempt {retries}). Waiting for download...")
-                    time.sleep(5)
                     # After clicking, try to find download link
                     try:
-                        download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href$='.mp4'], .download a, a.download")))
+                        download_anchor = wait.until(EC.presence_of_element_located(SITE_SELECTORS["cobalt"]["result"]))
                         href = download_anchor.get_attribute('href')
                         if not href:
                             href = download_anchor.get_attribute('data-url')
@@ -459,24 +481,18 @@ for batch_start in range(0, total_urls, batch_size):
                     try:
                         # attempt to click consent if present before interacting
                         try_click_do_not_consent()
-                        # musicaldown input usually has id 'link_url'
-                        url_input = wait.until(EC.presence_of_element_located((By.ID, "link_url")))
+                        url_input = wait.until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["input"]))
                         url_input.clear()
                         url_input.send_keys(url)
-                        # Submit the form (common selector)
-                        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "form#submit-form button[type=submit], form button[type=submit]")))
+                        # Submit the form
+                        submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["musicaldown"]["submit"]))
                         submit_btn.click()
                         print(f" Submitted to MusicalDown (attempt {retries}). Waiting for download link...")
                     except Exception as e:
                         raise
-                    # After submitting, prefer HD anchor with data-event hd_download_click
+                    # After submitting, prefer HD anchor
                     try:
-                        # First try HD download button explicitly
-                        try:
-                            download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download[data-event='hd_download_click']")), timeout=12)
-                        except TypeError:
-                            # Older selenium versions may not accept timeout param in this call
-                            download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download[data-event='hd_download_click']")))
+                        download_anchor = wait.until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_hd"]), timeout=15)
                         href = download_anchor.get_attribute('href')
                         if not href:
                             href = download_anchor.get_attribute('data-url')
@@ -487,9 +503,9 @@ for batch_start in range(0, total_urls, batch_size):
                         referer = driver.current_url
                         print(f" Extracted HD href: {href[:120]}...")
                     except TimeoutException:
-                        # HD not present — fallback to any 'a.download' (SD), record this event
+                        # HD not present — fallback to any 'a.download' (SD)
                         try:
-                            fallback_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download")), timeout=12)
+                            fallback_anchor = wait.until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_sd"]), timeout=12)
                             href = fallback_anchor.get_attribute('href')
                             if not href:
                                 href = fallback_anchor.get_attribute('data-url')
@@ -503,15 +519,15 @@ for batch_start in range(0, total_urls, batch_size):
                         except TimeoutException:
                             raise
                 else:
-                    # tikwm flow (original)
+                    # tikwm flow
                     try:
-                        url_input = wait.until(EC.presence_of_element_located((By.ID, "params")))
+                        url_input = wait.until(EC.presence_of_element_located(SITE_SELECTORS["tikwm"]["input"]))
                         url_input.clear()
                         url_input.send_keys(url)
-                        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-submit")))
+                        submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["tikwm"]["submit"]))
                         submit_btn.click()
                         print(f" Submitted to TikWM (attempt {retries}). Waiting...")
-                        time.sleep(2)
+                        # try catch for error box if parsing failed
                         try:
                             error_box = driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger[role='alert']")
                             if "url parsing is failed" in error_box.text.lower():
@@ -520,7 +536,7 @@ for batch_start in range(0, total_urls, batch_size):
                                 break
                         except NoSuchElementException:
                             pass
-                        download_link = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.btn.btn-success[download]")))
+                        download_link = wait.until(EC.presence_of_element_located(SITE_SELECTORS["tikwm"]["result"]))
                         href = download_link.get_attribute('href')
                         if not href or 'mp4' not in href.lower():
                             raise ValueError(f"Invalid href: {href}")
@@ -534,10 +550,9 @@ for batch_start in range(0, total_urls, batch_size):
                 # Attempt to download the extracted href (only if href was found)
                 if href:
                     future = download_executor.submit(download_file_from_href, href, cookies, referer, url, allow_duplicate=not check_exists, existing_files_set=existing_files)
-                    download_futures.append(future)
+                    download_futures.append((url, future))
                     url_success = True
                     batch_success += 1
-                    successful += 1
 
                     # For Cobalt, clear input for next use
                     if use_cobalt:
@@ -563,12 +578,10 @@ for batch_start in range(0, total_urls, batch_size):
             print(f" URL {idx} failed after {max_retries} retries")
             if url not in failed_urls:
                 failed_urls.append(url)
-        if idx < len(batch):
-            time.sleep(1)
     current_total = len(glob.glob('downloads/*.mp4')) - initial_count
     print(f"Batch {current_batch} complete ({batch_success}/{len(batch)} successful, {batch_skipped} skipped). Total processed: {current_total}/{total_urls}")
     if batch_end < total_urls:
-        time.sleep(15)
+        time.sleep(5) # Reduced batch delay
 
 # --- Move Section ---
 def load_user_map(map_file='user_dir_map.txt'):
@@ -651,8 +664,18 @@ def move_files_to_user_dirs(base_dir=r"C:\Bridge\Downloads\td"):
 
 # Wait for all downloads to complete
 print("\nWaiting for all downloads to finish...")
-for future in download_futures:
-    future.result()
+successful = 0
+for url, future in download_futures:
+    try:
+        if future.result():
+            successful += 1
+        else:
+            if url not in failed_urls:
+                failed_urls.append(url)
+    except Exception as e:
+        print(f" Error processing {url}: {e}")
+        if url not in failed_urls:
+            failed_urls.append(url)
 download_executor.shutdown(wait=True)
 
 # --- Small File Check ---
