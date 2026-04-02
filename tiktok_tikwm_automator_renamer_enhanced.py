@@ -171,7 +171,7 @@ SITE_SELECTORS = {
     "musicaldown": {
         "input": (By.ID, "link_url"),
         "submit": (By.CSS_SELECTOR, "form#submit-form button[type=submit], form button[type=submit]"),
-        "result_hd": (By.CSS_SELECTOR, "a.download[data-event='hd_download_click'], a.btn[href*='hd=1'], a.btn.orange"),
+        "result_hd": (By.CSS_SELECTOR, "a.download[data-event='hd_download_click'], a.btn[href*='hd=1'], a.btn[href*='video_hd']"),
         "result_sd": (By.CSS_SELECTOR, "a.download, a.btn[href*='musicaldown.com/download'], a.btn[target='_blank']")
     },
     "cobalt": {
@@ -290,6 +290,13 @@ except WebDriverException as e:
 
 driver.implicitly_wait(2)
 wait = WebDriverWait(driver, 20)
+
+# --- Helper: Robust click that handles interception ---
+def robust_click(element):
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
 
 # --- Helper: click "Do not consent" on MusicalDown whenever visible ---
 def try_click_do_not_consent():
@@ -438,7 +445,7 @@ for batch_start in range(0, total_urls, batch_size):
                     except TimeoutException:
                         # Fallback to any button
                         submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["cobalt"]["submit_fallback"]))
-                    submit_btn.click()
+                    robust_click(submit_btn)
                     print(f" Submitted to Cobalt (attempt {retries}). Waiting for download...")
                     # After clicking, try to find download link
                     try:
@@ -485,13 +492,14 @@ for batch_start in range(0, total_urls, batch_size):
                         url_input.send_keys(url)
                         # Submit the form
                         submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["musicaldown"]["submit"]))
-                        driver.execute_script("arguments[0].click();", submit_btn)
+                        robust_click(submit_btn)
                         print(f" Submitted to MusicalDown (attempt {retries}). Waiting for download link...")
                     except Exception as e:
                         raise
                     # After submitting, prefer HD anchor
                     try:
-                        download_anchor = WebDriverWait(driver, 15).until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_hd"]))
+                        # Be more specific for HD to avoid accidental SD fallback
+                        download_anchor = WebDriverWait(driver, 15).until(EC.element_to_be_clickable(SITE_SELECTORS["musicaldown"]["result_hd"]))
                         href = download_anchor.get_attribute('href')
                         if not href:
                             href = download_anchor.get_attribute('data-url')
@@ -524,7 +532,7 @@ for batch_start in range(0, total_urls, batch_size):
                         url_input.clear()
                         url_input.send_keys(url)
                         submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["tikwm"]["submit"]))
-                        driver.execute_script("arguments[0].click();", submit_btn)
+                        robust_click(submit_btn)
                         print(f" Submitted to TikWM (attempt {retries}). Waiting...")
                         # try catch for error box if parsing failed
                         try:
