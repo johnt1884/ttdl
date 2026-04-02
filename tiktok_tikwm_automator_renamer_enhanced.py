@@ -171,8 +171,8 @@ SITE_SELECTORS = {
     "musicaldown": {
         "input": (By.ID, "link_url"),
         "submit": (By.CSS_SELECTOR, "form#submit-form button[type=submit], form button[type=submit]"),
-        "result_hd": (By.CSS_SELECTOR, "a.download[data-event='hd_download_click']"),
-        "result_sd": (By.CSS_SELECTOR, "a.download")
+        "result_hd": (By.CSS_SELECTOR, "a.download[data-event='hd_download_click'], a.btn[href*='hd=1'], a.btn.orange"),
+        "result_sd": (By.CSS_SELECTOR, "a.download, a.btn[href*='musicaldown.com/download'], a.btn[target='_blank']")
     },
     "cobalt": {
         "input": (By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea"),
@@ -485,13 +485,13 @@ for batch_start in range(0, total_urls, batch_size):
                         url_input.send_keys(url)
                         # Submit the form
                         submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["musicaldown"]["submit"]))
-                        submit_btn.click()
+                        driver.execute_script("arguments[0].click();", submit_btn)
                         print(f" Submitted to MusicalDown (attempt {retries}). Waiting for download link...")
                     except Exception as e:
                         raise
                     # After submitting, prefer HD anchor
                     try:
-                        download_anchor = wait.until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_hd"]), timeout=15)
+                        download_anchor = WebDriverWait(driver, 15).until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_hd"]))
                         href = download_anchor.get_attribute('href')
                         if not href:
                             href = download_anchor.get_attribute('data-url')
@@ -501,10 +501,10 @@ for batch_start in range(0, total_urls, batch_size):
                         cookies = driver.get_cookies()
                         referer = driver.current_url
                         print(f" Extracted HD href: {href[:120]}...")
-                    except TimeoutException:
+                    except (TimeoutException, TypeError):
                         # HD not present — fallback to any 'a.download' (SD)
                         try:
-                            fallback_anchor = wait.until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_sd"]), timeout=12)
+                            fallback_anchor = WebDriverWait(driver, 12).until(EC.presence_of_element_located(SITE_SELECTORS["musicaldown"]["result_sd"]))
                             href = fallback_anchor.get_attribute('href')
                             if not href:
                                 href = fallback_anchor.get_attribute('data-url')
@@ -524,7 +524,7 @@ for batch_start in range(0, total_urls, batch_size):
                         url_input.clear()
                         url_input.send_keys(url)
                         submit_btn = wait.until(EC.element_to_be_clickable(SITE_SELECTORS["tikwm"]["submit"]))
-                        submit_btn.click()
+                        driver.execute_script("arguments[0].click();", submit_btn)
                         print(f" Submitted to TikWM (attempt {retries}). Waiting...")
                         # try catch for error box if parsing failed
                         try:
