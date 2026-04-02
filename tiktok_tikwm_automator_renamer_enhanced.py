@@ -473,7 +473,6 @@ for batch_start in range(0, total_urls, batch_size):
                                 print(f" ✅ Auto-download detected and renamed: {os.path.basename(expected_path)} ({actual_size / 1024 / 1024:.1f} MB)")
                                 url_success = True
                                 batch_success += 1
-                                successful += 1
                                 break
                         raise
                 elif use_musicaldown:
@@ -583,6 +582,22 @@ for batch_start in range(0, total_urls, batch_size):
     if batch_end < total_urls:
         time.sleep(5) # Reduced batch delay
 
+# Wait for all downloads to complete before moving files
+print("\nWaiting for all downloads to finish...")
+successful = 0
+for url, future in download_futures:
+    try:
+        if future.result():
+            successful += 1
+        else:
+            if url not in failed_urls:
+                failed_urls.append(url)
+    except Exception as e:
+        print(f" Error processing {url}: {e}")
+        if url not in failed_urls:
+            failed_urls.append(url)
+download_executor.shutdown(wait=True)
+
 # --- Move Section ---
 def load_user_map(map_file='user_dir_map.txt'):
     user_map = {}
@@ -661,22 +676,6 @@ def move_files_to_user_dirs(base_dir=r"C:\Bridge\Downloads\td"):
     save_user_map(user_map)
     print(f"\nMove summary: {moved} moved, {replaced} replaced, {skipped} skipped.")
     print("User directory mappings saved to user_dir_map.txt\n")
-
-# Wait for all downloads to complete
-print("\nWaiting for all downloads to finish...")
-successful = 0
-for url, future in download_futures:
-    try:
-        if future.result():
-            successful += 1
-        else:
-            if url not in failed_urls:
-                failed_urls.append(url)
-    except Exception as e:
-        print(f" Error processing {url}: {e}")
-        if url not in failed_urls:
-            failed_urls.append(url)
-download_executor.shutdown(wait=True)
 
 # --- Small File Check ---
 print("\nChecking for small files (< 2KB)...")
