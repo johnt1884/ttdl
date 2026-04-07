@@ -122,6 +122,23 @@ def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='down
     print(f" ❌ Failed to download complete file after {max_retries} attempts.")
     return False
 
+def yt_dlp_download(url, output_dir='downloads'):
+    print(f" Downloading with yt-dlp: {url}")
+    # Replicating privatetok.py method
+    command = [
+        "yt-dlp",
+        "--cookies-from-browser", "firefox",
+        "-f", "bestvideo+bestaudio/best",
+        "-o", os.path.join(output_dir, "%(uploader)s - %(id)s.%(ext)s"),
+        url
+    ]
+    try:
+        subprocess.run(command, check=True)
+        return True
+    except Exception as e:
+        print(f" ❌ yt-dlp failed for {url}: {e}")
+        return False
+
 # --- Read URLs ---
 with open('urls.txt', 'r', encoding='utf-8') as f:
     urls = [line.strip() for line in f if line.strip()]
@@ -158,7 +175,8 @@ if os.path.exists(base_td):
 sites = [
     ("TikWM", "https://www.tikwm.com/originalDownloader.html"),
     ("MusicalDown", "https://musicaldown.com/en"),
-    ("Cobalt", "https://cobalt.tools")
+    ("Cobalt", "https://cobalt.tools"),
+    ("yt-dlp", None)
 ]
 
 # --- Selectors Mapping ---
@@ -191,6 +209,18 @@ print("Select one option (1-12):")
 menu_options = []
 idx = 1
 for s_name, s_url in sites:
+    if s_name == "yt-dlp":
+        label = f"{idx}) Use yt-dlp (No browser)"
+        menu_options.append({
+            "index": idx,
+            "site_name": s_name,
+            "site_url": s_url,
+            "kill_before": False,
+            "headless": True
+        })
+        print(label)
+        idx += 1
+        continue
     for action_name, params in actions:
         label = f"{idx}) {action_name} using {s_name}"
         menu_options.append({
@@ -211,6 +241,7 @@ selected = menu_options[choice_idx - 1]
 use_cobalt = (selected["site_name"].lower() == "cobalt")
 use_musicaldown = (selected["site_name"].lower() == "musicaldown")
 use_tikwm = (selected["site_name"].lower() == "tikwm")
+use_ytdlp = (selected["site_name"].lower() == "yt-dlp")
 start_url = selected["site_url"]
 kill_before_start = selected["kill_before"]
 headless_mode = selected["headless"]
@@ -270,26 +301,30 @@ if use_cobalt and not headless_mode:
     options.add_argument('--disable-blink-features=AutomationControlled')
 
 driver = None
-try:
-    if use_cobalt and use_uc:
-        driver = uc.Chrome(options=options, version_main=None) # Auto-detect Chrome version
-        print("Using undetected-chromedriver!")
-    else:
-        service = Service('./chromedriver.exe')
-        driver = webdriver.Chrome(service=service, options=options)
-        print(f"ChromeDriver launched successfully ({'headless' if headless_mode else 'visible'} mode)!")
-        if use_cobalt and not use_uc:
-            # try to remove webdriver flag
-            try:
-                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            except Exception:
-                pass
-except WebDriverException as e:
-    print(f"Failed to launch ChromeDriver: {e}")
-    exit()
+if use_ytdlp:
+    print("Using yt-dlp mode. No browser will be launched.")
+else:
+    try:
+        if use_cobalt and use_uc:
+            driver = uc.Chrome(options=options, version_main=None) # Auto-detect Chrome version
+            print("Using undetected-chromedriver!")
+        else:
+            service = Service('./chromedriver.exe')
+            driver = webdriver.Chrome(service=service, options=options)
+            print(f"ChromeDriver launched successfully ({'headless' if headless_mode else 'visible'} mode)!")
+            if use_cobalt and not use_uc:
+                # try to remove webdriver flag
+                try:
+                    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                except Exception:
+                    pass
+    except WebDriverException as e:
+        print(f"Failed to launch ChromeDriver: {e}")
+        exit()
 
-driver.implicitly_wait(2)
-wait = WebDriverWait(driver, 20)
+if driver:
+    driver.implicitly_wait(2)
+    wait = WebDriverWait(driver, 20)
 
 # --- Helper: Robust click that handles interception ---
 def robust_click(element):
@@ -318,7 +353,7 @@ def try_click_do_not_consent():
     return False
 
 # --- For Cobalt, handle initial Turnstile if needed ---
-if use_cobalt:
+if use_cobalt and driver:
     print(f"Navigating to {start_url}...")
     driver.get(start_url)
     time.sleep(3) # Initial load
@@ -368,15 +403,16 @@ print("================\n")
 
 if not urls_to_process:
     print("All URLs already downloaded or nothing to process! Exiting.")
-    try:
-        driver.quit()
-    except Exception:
-        pass
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
     exit()
 
 # --- Batch processing ---
 total_urls = len(urls_to_process)
-successful = 0
+successful_total = 0
 failed_urls = []
 sd_saved = [] # record situations where SD was used (url, href)
 max_workers = min(5, os.cpu_count() or 4)
@@ -393,14 +429,15 @@ for batch_start in range(0, total_urls, batch_size):
     print(f"\n--- Processing batch {current_batch}/{num_batches} (URLs {batch_start+1}-{batch_end} of {total_urls}) ---")
 
     # Load the site once per batch
-    try:
-        driver.get(start_url)
-        # Use smarter waits instead of fixed sleep
-        site_key = selected["site_name"].lower()
-        wait.until(EC.presence_of_element_located(SITE_SELECTORS[site_key]["input"]))
-        try_click_do_not_consent()
-    except Exception as e:
-        print(f" Failed to load site for batch {current_batch}: {e}")
+    if driver:
+        try:
+            driver.get(start_url)
+            # Use smarter waits instead of fixed sleep
+            site_key = selected["site_name"].lower()
+            wait.until(EC.presence_of_element_located(SITE_SELECTORS[site_key]["input"]))
+            try_click_do_not_consent()
+        except Exception as e:
+            print(f" Failed to load site for batch {current_batch}: {e}")
 
     batch_success, batch_skipped = 0, 0
     for idx, url in enumerate(batch, 1):
@@ -415,6 +452,15 @@ for batch_start in range(0, total_urls, batch_size):
         retries, max_retries, url_success = 0, 3, False
         while retries < max_retries and not url_success:
             retries += 1
+            if use_ytdlp:
+                if yt_dlp_download(url):
+                    url_success = True
+                    successful_total += 1
+                    batch_success += 1
+                    break
+                else:
+                    continue
+
             try:
                 # Check if we need to reload (non-SPA and input field missing or it's a retry)
                 site_key = selected["site_name"].lower()
@@ -570,6 +616,7 @@ for batch_start in range(0, total_urls, batch_size):
                             pass
                     # After successful download, stay on page to see if we can reuse it
                     break
+
             except TimeoutException:
                 # Exponential backoff for retries
                 wait_time = retries
@@ -591,12 +638,13 @@ for batch_start in range(0, total_urls, batch_size):
         time.sleep(5) # Reduced batch delay
 
 # Wait for all downloads to complete before moving files
-print("\nWaiting for all downloads to finish...")
-successful = 0
+if driver:
+    print("\nWaiting for all downloads to finish...")
+successful_this_run = 0
 for url, future in download_futures:
     try:
         if future.result():
-            successful += 1
+            successful_this_run += 1
         else:
             if url not in failed_urls:
                 failed_urls.append(url)
@@ -604,7 +652,9 @@ for url, future in download_futures:
         print(f" Error processing {url}: {e}")
         if url not in failed_urls:
             failed_urls.append(url)
-download_executor.shutdown(wait=True)
+if driver:
+    download_executor.shutdown(wait=True)
+successful_total += successful_this_run
 
 # --- Move Section ---
 def load_user_map(map_file='user_dir_map.txt'):
@@ -629,8 +679,8 @@ def move_files_to_user_dirs(base_dir=r"C:\Bridge\Downloads\td"):
         print("No files to move.")
         return
     print(f"\nMove downloaded files to user directories under {base_dir}?")
-    resp = input("(y/n): ").strip().lower()
-    if resp != 'y':
+    resp = input("(y/n, default y): ").strip().lower()
+    if resp == 'n':
         return
     usernames = {}
     for f in downloads:
@@ -702,9 +752,27 @@ else:
     print("No small files found.")
 
 # --- Summary ---
-print(f"\nAutomation complete! Successful: {successful}/{total_urls}")
+print(f"\nAutomation complete! Successful: {successful_total}/{total_urls}")
 failed_count = len(failed_urls)
 print(f"Failed: {failed_count}/{total_urls}")
+
+if failed_count > 0 and not use_ytdlp:
+    print(f"\nThere are {failed_count} failed downloads.")
+    retry_resp = input("Would you like to try downloading these failed URLs with yt-dlp? (y/n): ").strip().lower()
+    if retry_resp == 'y':
+        print("\nRetrying failed URLs with yt-dlp...")
+        new_failed = []
+        retry_success = 0
+        for u in failed_urls:
+            if yt_dlp_download(u):
+                retry_success += 1
+                successful_total += 1
+            else:
+                new_failed.append(u)
+        failed_urls = new_failed
+        failed_count = len(failed_urls)
+        print(f"\nRetry complete. Success: {retry_success}, Still failed: {failed_count}")
+
 if failed_count > 0:
     resp = input(f"\nGenerate failed_urls.txt? (y/n): ").strip().lower()
     if resp == 'y':
@@ -712,6 +780,16 @@ if failed_count > 0:
             for u in failed_urls:
                 f.write(u + '\n')
         print("Generated failed_urls.txt")
+
+# --- Move Files ---
+move_files_to_user_dirs()
+
+# Cleanup driver at the end of the script
+if driver:
+    try:
+        driver.quit()
+    except Exception:
+        pass
 
 # SD fallback report (per your request)
 if sd_saved:
@@ -725,4 +803,4 @@ if sd_saved:
     if resp != 'n':
         with open('sd_fallback.txt', 'w', encoding='utf-8') as f:
             for s in sd_saved:
-                f.write(f"{s.
+                f.write(f"{s['tiktok_url']}: {s['href']}\n")
